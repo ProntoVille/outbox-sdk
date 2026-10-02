@@ -1,11 +1,11 @@
-# @prontoville/outbox
+# @getoutbox/sdk
 
 Outbox TypeScript SDK for server-side transactional email. Supports Node.js 20+, ESM and CommonJS. Zero runtime dependencies.
 
 ## Installation
 
 ```sh
-npm install @prontoville/outbox
+npm install @getoutbox/sdk
 ```
 
 This is the intended npm package name. Registry publication must be completed before this command will work.
@@ -13,7 +13,7 @@ This is the intended npm package name. Registry publication must be completed be
 Create a platform account, verify your mailbox, enable managed sending or connect a provider, verify your sender domain, then create an API key in Developers. Store the key and your platform's HTTPS origin in your backend's secret manager as `MAIL_API_KEY` and `MAIL_BASE_URL`.
 
 ```ts
-import { Outbox, OutboxApiError } from '@prontoville/outbox';
+import { Outbox, OutboxApiError } from '@getoutbox/sdk';
 
 const mail = new Outbox({
   apiKey: process.env.MAIL_API_KEY!,
@@ -31,7 +31,7 @@ const message = await mail.send({
 const status = await mail.getMessage(message.id);
 ```
 
-CommonJS: `const { Outbox } = require('@prontoville/outbox');`.
+CommonJS: `const { Outbox } = require('@getoutbox/sdk');`.
 
 Your application creates and consumes password-reset tokens; the SDK sends their email. Never put API keys in browser/mobile bundles or log reset URLs. Use plain text or escape untrusted values included in HTML.
 

@@ -1,6 +1,6 @@
 {
-  "name": "@prontoville/outbox",
-  "version": "0.1.0",
+  "name": "@getoutbox/sdk",
+  "version": "0.1.1",
   "description": "Outbox transactional email SDK for Node.js and TypeScript",
   "type": "module",
   "main": "./dist/index.cjs",
