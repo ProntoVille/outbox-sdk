@@ -8,8 +8,6 @@ Outbox TypeScript SDK for server-side transactional email. Supports Node.js 20+,
 npm install @getoutbox/sdk
 ```
 
-This is the intended npm package name. Registry publication must be completed before this command will work.
-
 Create a platform account, verify your mailbox, enable managed sending or connect a provider, verify your sender domain, then create an API key in Developers. Store the key and your platform's HTTPS origin in your backend's secret manager as `MAIL_API_KEY` and `MAIL_BASE_URL`.
 
 ```ts
