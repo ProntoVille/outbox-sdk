@@ -1,6 +1,6 @@
 {
   "name": "@getoutbox/sdk",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Outbox transactional email SDK for Node.js and TypeScript",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -22,10 +22,11 @@
     "dist",
     "src",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3"
   },
   "license": "MIT",
   "repository": {
