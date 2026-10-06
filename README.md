@@ -103,4 +103,4 @@ npm test
 npm pack --dry-run
 ```
 
-Source: `src/index.ts`. Build outputs ESM, CommonJS, declarations and source maps to `dist/`. Releases go through `.github/workflows/publish.yml` (npm trusted publishing) after the version is bumped.
+Source: `src/index.ts`. Build outputs ESM, CommonJS, declarations and source maps to `dist/`. To release, bump `version` in `package.json` and push to main: `.github/workflows/publish.yml` publishes any version npm does not have yet, using npm trusted publishing.

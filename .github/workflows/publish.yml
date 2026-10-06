@@ -1,9 +1,17 @@
 name: Publish SDK
+# Publishes whenever main carries a package.json version that npm doesn't have yet.
+# Auth is npm trusted publishing (OIDC): no tokens or one-time passwords.
 on:
+  push:
+    branches: [main]
+    paths: [package.json]
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
   id-token: write
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -13,7 +21,26 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm test
-      # Configure this repository/workflow as the package's npm trusted publisher first.
-      - run: npm publish --access public --provenance
+      - name: Check whether this version is already published
+        id: version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.publish == 'true'
+        run: npm install -g npm@^11.5.1
+      - if: steps.version.outputs.publish == 'true'
+        run: npm ci && npm test
+      - if: steps.version.outputs.publish == 'true'
+        run: npm publish --access public --provenance
+      - if: steps.version.outputs.publish == 'true'
+        name: Tag the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/v${{ steps.version.outputs.version }}" -f sha="${{ github.sha }}" || echo "Tag already exists"
