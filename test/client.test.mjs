@@ -135,9 +135,12 @@ test('an unreadable 2xx body is retried with the same key, then reported with it
 });
 
 test('timeouts and network failures become OutboxConnectionError carrying the key', async () => {
+  // AbortSignal.timeout's timer doesn't hold the event loop open; a real hung socket would.
+  const socket = setTimeout(() => {}, 5_000);
   const hang = client((_u, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason))), { timeoutMs: 20, maxRetries: 0 });
   await assert.rejects(hang.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }, { idempotencyKey: 'order:7' }), (e) =>
     e instanceof OutboxConnectionError && e instanceof OutboxError && e.code === 'timeout' && e.idempotencyKey === 'order:7' && e.cause.name === 'TimeoutError');
+  clearTimeout(socket);
 
   let calls = 0;
   const down = client(async () => { calls++; throw new TypeError('fetch failed'); }, { maxRetries: 1 });
