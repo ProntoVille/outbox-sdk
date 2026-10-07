@@ -1,4 +1,4 @@
-export const VERSION = '0.3.0';
+export const VERSION = '0.3.1';
 
 /** `ada@example.com` or `Ada Obi <ada@example.com>`. */
 export type Address = string;
@@ -94,6 +94,8 @@ export interface OutboxOptions {
 export type MailClientOptions = OutboxOptions;
 
 export class OutboxError extends Error {
+  /** The idempotency key the failed request carried. Retry with it and the API will not send twice. */
+  idempotencyKey: string | null = null;
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = 'OutboxError';
@@ -106,15 +108,20 @@ export type ErrorCode =
   | 'payment_required' | 'quota_exceeded' | 'not_found' | 'template_not_found' | 'conflict' | 'payload_too_large'
   | 'unprocessable' | 'domain_not_verified' | 'invalid_sender' | 'missing_template_data' | 'sending_not_configured' | 'sending_unavailable'
   | 'sandbox_recipient_not_allowed' | 'unsupported_by_provider' | 'rate_limited' | 'sandbox_limit_reached'
-  | 'internal_error' | 'unavailable' | (string & {});
+  | 'internal_error' | 'unavailable' | 'invalid_response' | (string & {});
 
-/** The API answered with a non-2xx status. */
+/**
+ * The API answered with a non-2xx status, or (code `invalid_response`) with a 2xx whose body could not be read.
+ * On a send, `invalid_response` usually means the message was accepted: retry with `idempotencyKey` to find out.
+ */
 export class OutboxApiError extends OutboxError {
   status: number;
   code: ErrorCode;
   /** Quote this to support. */
   requestId: string | null;
   body: unknown;
+  /** The server's Retry-After hint in milliseconds, when it sent one. */
+  retryAfterMs: number | null = null;
   constructor(status: number, message: string, body: unknown = null, requestId: string | null = null) {
     super(message);
     this.name = 'OutboxApiError';
@@ -123,6 +130,16 @@ export class OutboxApiError extends OutboxError {
     const parsed = body as { code?: string; request_id?: string } | null;
     this.code = parsed?.code ?? 'error';
     this.requestId = parsed?.request_id ?? requestId;
+  }
+}
+
+/** No answer from the API after every attempt. The request may or may not have reached it. */
+export class OutboxConnectionError extends OutboxError {
+  code: 'timeout' | 'connection_error';
+  constructor(message: string, code: 'timeout' | 'connection_error', cause: unknown) {
+    super(message, { cause });
+    this.name = 'OutboxConnectionError';
+    this.code = code;
   }
 }
 
@@ -202,6 +219,10 @@ export class Outbox {
     if (body !== undefined) headers['content-type'] = 'application/json';
     if (idempotencyKey) headers['idempotency-key'] = idempotencyKey;
     const payload = body === undefined ? undefined : JSON.stringify(body);
+    const fail = (error: OutboxError) => {
+      error.idempotencyKey = idempotencyKey ?? null;
+      return error;
+    };
 
     for (let attempt = 0; ; attempt++) {
       const canRetry = retryable && attempt < this.#maxRetries;
@@ -210,21 +231,28 @@ export class Outbox {
         const timeout = AbortSignal.timeout(this.#timeoutMs);
         response = await this.#fetch(this.#baseUrl + path, { method, headers, body: payload, redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
       } catch (error) {
-        if (signal?.aborted || !canRetry) throw error;
+        if (signal?.aborted) throw signal.reason;
+        if (!canRetry) {
+          const timedOut = (error as { name?: string } | null)?.name === 'TimeoutError';
+          throw fail(new OutboxConnectionError(timedOut ? `Outbox did not respond within ${this.#timeoutMs}ms` : 'Could not reach Outbox', timedOut ? 'timeout' : 'connection_error', error));
+        }
         await sleep(retryDelay(attempt), signal);
         continue;
       }
       const data = await response.json().catch(() => null);
       const requestId = response.headers.get('x-request-id');
-      if (response.ok) {
-        if (data === null) throw new OutboxApiError(response.status, 'Outbox API returned invalid JSON', null, requestId);
-        return data as T;
-      }
-      if (canRetry && isRetryableStatus(response.status)) {
-        await sleep(retryDelay(attempt, response.headers.get('retry-after')), signal);
+      const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'));
+      if (response.ok && data !== null) return data as T;
+      if (canRetry && (response.ok || isRetryableStatus(response.status))) {
+        await sleep(retryDelay(attempt, retryAfterMs), signal);
         continue;
       }
-      throw new OutboxApiError(response.status, (data as { error?: string } | null)?.error || `Outbox API returned HTTP ${response.status}`, data, requestId);
+      const error = response.ok
+        ? new OutboxApiError(response.status, `Outbox API returned HTTP ${response.status} with an unreadable body`, null, requestId)
+        : new OutboxApiError(response.status, (data as { error?: string } | null)?.error || `Outbox API returned HTTP ${response.status}`, data, requestId);
+      if (response.ok) error.code = 'invalid_response';
+      error.retryAfterMs = retryAfterMs;
+      throw fail(error);
     }
   }
 }
@@ -247,10 +275,17 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /** Retry-After when the server gives one (capped at 30s), else exponential backoff with full jitter. */
-function retryDelay(attempt: number, retryAfter?: string | null): number {
-  const seconds = Number(retryAfter);
-  if (retryAfter && Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 30_000);
+function retryDelay(attempt: number, retryAfterMs?: number | null): number {
+  if (retryAfterMs != null) return Math.min(retryAfterMs, 30_000);
   return Math.random() * Math.min(500 * 2 ** attempt, 8_000);
+}
+
+/** Retry-After as delay-seconds or an HTTP date, in milliseconds from now. */
+function parseRetryAfter(value: string | null, now = Date.now()): number | null {
+  if (!value) return null;
+  if (/^\d+$/.test(value.trim())) return Number(value) * 1000;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : Math.max(at - now, 0);
 }
 
 export type WebhookEventType =

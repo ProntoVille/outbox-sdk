@@ -11,7 +11,7 @@ Before sending: create an account, enable managed sending (or connect a provider
 ## Send
 
 ```ts
-import { Outbox, OutboxApiError } from '@getoutbox/sdk';
+import { Outbox, OutboxApiError, OutboxConnectionError } from '@getoutbox/sdk';
 
 const outbox = new Outbox(); // reads OUTBOX_API_KEY; base URL defaults to https://outboxstack.app
 
@@ -76,23 +76,29 @@ const bounced = await outbox.listMessages({ status: 'bounced', limit: 100 });
 
 ## Retries and idempotency
 
-Timeouts, network errors, 429 and 5xx are retried up to `maxRetries` times (default 2), using `Retry-After` when the API sends it and jittered exponential backoff otherwise. 4xx errors are never retried.
+Timeouts, network errors, 429, 5xx and 2xx responses with an unreadable body are retried up to `maxRetries` times (default 2), using `Retry-After` (seconds or an HTTP date) when the API sends it and jittered exponential backoff otherwise. 4xx errors are never retried.
 
 A retry never sends twice. `send()` always carries an idempotency key and generates one when you don't pass one. Pass your own key, derived from the event that triggered the email, to stay safe across process restarts and job re-runs as well. `sendBatch` retries only when **every** item has an `idempotencyKey`.
 
 ## Errors
 
+Every error the client throws is an `OutboxError`, except your own `signal` aborting, which rethrows its reason.
+
 ```ts
 try {
   await outbox.send(message);
 } catch (e) {
-  if (!(e instanceof OutboxApiError)) throw e; // network error or timeout after retries, or AbortError
-  if (e.code === 'domain_not_verified') { /* prompt to finish DNS setup */ }
-  console.error(e.status, e.code, e.message, e.requestId); // quote requestId to support
+  if (e instanceof OutboxConnectionError) {
+    // e.code is 'timeout' or 'connection_error'. The message may have been accepted:
+    // retry with e.idempotencyKey and it will not be sent twice.
+  } else if (e instanceof OutboxApiError) {
+    if (e.code === 'domain_not_verified') { /* prompt to finish DNS setup */ }
+    console.error(e.status, e.code, e.message, e.requestId, e.retryAfterMs); // quote requestId to support
+  } else throw e;
 }
 ```
 
-Branch on `e.code`; the message text may change. Common codes:
+`e.idempotencyKey` is set on every error from `send()`, including the generated key when you didn't pass one; it is `null` for other calls. Branch on `e.code`; the message text may change. Common codes:
 
 | Code | Status | Meaning |
 |---|---|---|
@@ -102,6 +108,7 @@ Branch on `e.code`; the message text may change. Common codes:
 | `template_not_found` | 404 | No template with that id or slug. |
 | `domain_not_verified`, `sending_not_configured`, `missing_template_data`, `unsupported_by_provider` | 422 | Fix your setup or data. |
 | `rate_limited`, `sandbox_limit_reached` | 429 | Retried automatically. |
+| `invalid_response` | 2xx | The API answered but the body could not be read, even after retries. A send was probably accepted; retry with `e.idempotencyKey` to confirm. |
 
 The full list is in the [OpenAPI spec](https://outboxstack.app/openapi.json).
 

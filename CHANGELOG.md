@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1
+
+- A 2xx response with an empty or non-JSON body is retried with the same idempotency key instead of failing straight away; if it persists, `OutboxApiError` has code `invalid_response`.
+- Errors carry the request's `idempotencyKey`, including the one `send()` generates, so a manual retry cannot duplicate the message.
+- Timeouts and network failures after the last retry throw `OutboxConnectionError` (`code`: `timeout` or `connection_error`, original error as `cause`) instead of a raw `TypeError` or `DOMException`. Your own `signal` still rethrows its reason.
+- `Retry-After` given as an HTTP date is honoured; `OutboxApiError.retryAfterMs` exposes the hint.
+- Tests for these cases and for the CommonJS and ESM type declarations. The publish workflow pins npm to an exact version.
+
 ## 0.3.0
 
 - `to` accepts a list; new `cc` and `bcc`. Each recipient gets its own message id, returned in `result.recipients`. Requires the matching API release.

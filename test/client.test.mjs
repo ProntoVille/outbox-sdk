@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { Outbox, OutboxApiError, MailClient, VERSION, verifyWebhook, WebhookVerificationError } from '../dist/index.js';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { Outbox, OutboxError, OutboxApiError, OutboxConnectionError, MailClient, VERSION, verifyWebhook, WebhookVerificationError } from '../dist/index.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
@@ -119,6 +121,45 @@ test('API errors expose code and request id', async () => {
   await assert.rejects(mail.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }), (e) => e.code === 'domain_not_verified' && e.requestId === 'req_abc' && e.status === 422);
   const bare = client(async () => new Response('oops', { status: 400, headers: { 'x-request-id': 'req_hdr' } }));
   await assert.rejects(bare.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }), (e) => e.code === 'error' && e.requestId === 'req_hdr');
+});
+
+test('an unreadable 2xx body is retried with the same key, then reported with it', async () => {
+  const keys = [];
+  const flaky = client(async (_u, init) => { keys.push(init.headers['idempotency-key']); return keys.length === 1 ? new Response('', { status: 202 }) : json({ id: ID, status: 'queued', duplicate: true }, 202); });
+  assert.equal((await flaky.send({ from: 'a@x.com', to: 'b@x.com', text: 't' })).duplicate, true);
+  assert.equal(keys[0], keys[1]);
+
+  const broken = client(async () => new Response('<html>', { status: 202, headers: { 'x-request-id': 'req_1' } }), { maxRetries: 0 });
+  await assert.rejects(broken.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }), (e) =>
+    e instanceof OutboxApiError && e.code === 'invalid_response' && e.status === 202 && e.requestId === 'req_1' && /^[0-9a-f-]{36}$/.test(e.idempotencyKey));
+});
+
+test('timeouts and network failures become OutboxConnectionError carrying the key', async () => {
+  const hang = client((_u, init) => new Promise((_, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason))), { timeoutMs: 20, maxRetries: 0 });
+  await assert.rejects(hang.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }, { idempotencyKey: 'order:7' }), (e) =>
+    e instanceof OutboxConnectionError && e instanceof OutboxError && e.code === 'timeout' && e.idempotencyKey === 'order:7' && e.cause.name === 'TimeoutError');
+
+  let calls = 0;
+  const down = client(async () => { calls++; throw new TypeError('fetch failed'); }, { maxRetries: 1 });
+  await assert.rejects(down.getMessage(ID), (e) => e instanceof OutboxConnectionError && e.code === 'connection_error' && e.idempotencyKey === null && e.cause instanceof TypeError);
+  assert.equal(calls, 2);
+});
+
+test('Retry-After is honoured as seconds or an HTTP date and exposed on the error', async () => {
+  const at = new Date(Date.now() + 5_000).toUTCString();
+  const limited = client(async () => json({ error: 'slow down', code: 'rate_limited' }, 429, { 'retry-after': at }), { maxRetries: 0 });
+  await assert.rejects(limited.getMessage(ID), (e) => e.code === 'rate_limited' && e.retryAfterMs > 3_000 && e.retryAfterMs <= 5_000);
+
+  let calls = 0;
+  const past = client(async () => (++calls === 1 ? json({ error: 'busy' }, 503, { 'retry-after': 'Wed, 21 Oct 2015 07:28:00 GMT' }) : json({ id: ID })));
+  const started = Date.now();
+  assert.equal((await past.getMessage(ID)).id, ID);
+  assert.ok(Date.now() - started < 1_000, 'a past date retries immediately');
+});
+
+test('the published types compile for CommonJS and ESM consumers', () => {
+  const tsc = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
+  execFileSync(process.execPath, [tsc, '-p', fileURLToPath(new URL('types/tsconfig.json', import.meta.url))], { stdio: 'pipe' });
 });
 
 // Shared vector: the Go signer and PHP verifier are tested against the same values.
