@@ -1,4 +1,4 @@
-export const VERSION = '0.3.1';
+export const VERSION = '0.4.0';
 
 /** `ada@example.com` or `Ada Obi <ada@example.com>`. */
 export type Address = string;
@@ -13,7 +13,7 @@ export interface Attachment {
   contentId?: string;
 }
 
-export interface Message {
+export interface MessageBase {
   /** One address or a list. Every address in to, cc and bcc gets its own message id; at most 50 in total. */
   to: Address | Address[];
   /** Display name when `to` is a single bare address. */
@@ -25,12 +25,6 @@ export interface Message {
   fromName?: string;
   /** Where replies go when it differs from `from`, e.g. a support inbox. */
   replyTo?: string;
-  subject?: string;
-  html?: string;
-  text?: string;
-  /** Template id or slug; `subject`/`html`/`text` come from the template. */
-  template?: string;
-  data?: Record<string, unknown>;
   /** Up to 20 custom headers. Routing, authentication and provider-control headers are refused. */
   headers?: Record<string, string>;
   /** Up to 10 files, 10 MB in total. */
@@ -38,7 +32,12 @@ export interface Message {
   /** Up to 10 string values of your own, returned by getMessage() and in webhooks. */
   metadata?: Record<string, string>;
 }
-export interface BatchMessage extends Message { idempotencyKey?: string; }
+/** Your own content: a subject plus html, text or both. A text part is generated from html when omitted. */
+export type InlineContent = { subject: string; template?: never; data?: never } & ({ html: string; text?: string } | { text: string; html?: string });
+/** A stored template supplies the subject, html and text. */
+export interface TemplateContent { template: string; data?: Record<string, unknown>; subject?: never; html?: never; text?: never; }
+export type Message = MessageBase & (InlineContent | TemplateContent);
+export type BatchMessage = Message & { idempotencyKey?: string };
 
 export type MessageStatus = 'queued' | 'sending' | 'sent' | 'delivered' | 'bounced' | 'complained' | 'failed' | 'suppressed' | 'cancelled';
 export interface RecipientResult { email: string; id: string; status: MessageStatus; duplicate: boolean; }
@@ -73,6 +72,35 @@ export interface MessageDetail extends MessageSummary {
 }
 /** @deprecated Use MessageDetail. */
 export type MessageResult = MessageDetail;
+export interface MessagePage {
+  messages: MessageSummary[];
+  /** Pass as `after` for the next page; null on the last page. */
+  next: string | null;
+}
+export interface ListMessagesOptions extends RequestOptions {
+  status?: MessageStatus;
+  /** Only recipients whose address contains this text (case-insensitive). */
+  to?: string;
+  /** 1–200. Default 50. */
+  limit?: number;
+  /** The `next` value from a previous page. */
+  after?: string;
+}
+export interface CancelResult { id: string; status: 'cancelled'; }
+
+export type SuppressionReason = 'bounce' | 'complaint' | 'unsubscribe' | 'manual';
+export interface Suppression { email: string; reason: SuppressionReason; created_at: string; }
+export interface SuppressionPage {
+  suppressions: Suppression[];
+  /** Pass as `after` for the next page; null on the last page. */
+  next: string | null;
+}
+export interface ListSuppressionsOptions extends RequestOptions {
+  /** 1–1000. Default 1000. */
+  limit?: number;
+  /** The `next` value from a previous page. */
+  after?: string;
+}
 
 export interface RequestOptions { signal?: AbortSignal; }
 export interface SendOptions extends RequestOptions {
@@ -105,7 +133,7 @@ export class OutboxError extends Error {
 export type ErrorCode =
   | 'invalid_request' | 'invalid_address' | 'missing_content' | 'invalid_header' | 'invalid_metadata' | 'invalid_attachment' | 'too_many_recipients'
   | 'unauthorized' | 'forbidden' | 'sender_domain_not_allowed' | 'account_restricted'
-  | 'payment_required' | 'quota_exceeded' | 'not_found' | 'template_not_found' | 'conflict' | 'payload_too_large'
+  | 'payment_required' | 'quota_exceeded' | 'not_found' | 'template_not_found' | 'conflict' | 'not_cancellable' | 'payload_too_large'
   | 'unprocessable' | 'domain_not_verified' | 'invalid_sender' | 'missing_template_data' | 'sending_not_configured' | 'sending_unavailable'
   | 'sandbox_recipient_not_allowed' | 'unsupported_by_provider' | 'rate_limited' | 'sandbox_limit_reached'
   | 'internal_error' | 'unavailable' | 'invalid_response' | (string & {});
@@ -152,6 +180,16 @@ const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, 
   const onAbort = () => { clearTimeout(timer); reject(signal!.reason); };
   signal?.addEventListener('abort', onAbort, { once: true });
 });
+
+function checkEmail(email: unknown): void {
+  if (typeof email !== 'string' || !email.includes('@') || email.length > 254) throw new OutboxError('A valid email address is required');
+}
+
+function query(params: Record<string, string | number | undefined>): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== '') q.set(key, String(value));
+  return q.size ? '?' + q : '';
+}
 
 function checkIdempotencyKey(key: unknown): void {
   if (key !== undefined && (typeof key !== 'string' || !key.trim() || key.length > 200)) throw new OutboxError('idempotencyKey must contain 1–200 characters');
@@ -205,13 +243,67 @@ export class Outbox {
     return this.#request<MessageDetail>('GET', '/v1/messages/' + id, { retryable: true, signal });
   }
 
-  /** Most recent first. `limit` is 1–200 (default 50). */
-  async listMessages({ status, limit, signal }: { status?: MessageStatus; limit?: number } & RequestOptions = {}): Promise<MessageSummary[]> {
-    const query = new URLSearchParams();
-    if (status) query.set('status', status);
-    if (limit !== undefined) query.set('limit', String(limit));
-    const path = '/v1/messages' + (query.size ? '?' + query : '');
-    return (await this.#request<{ messages: MessageSummary[] }>('GET', path, { retryable: true, signal })).messages;
+  /** The newest messages, most recent first. For older ones use listMessagesPage() or iterateMessages(). */
+  async listMessages(options: ListMessagesOptions = {}): Promise<MessageSummary[]> {
+    return (await this.listMessagesPage(options)).messages;
+  }
+
+  /** One page, most recent first. Pass `next` back as `after` until it is null. */
+  listMessagesPage({ status, to, limit, after, signal }: ListMessagesOptions = {}): Promise<MessagePage> {
+    return this.#request<MessagePage>('GET', '/v1/messages' + query({ status, to, limit, after }), { retryable: true, signal });
+  }
+
+  /** Every matching message, most recent first, fetched a page at a time. */
+  async *iterateMessages({ after, ...options }: ListMessagesOptions = {}): AsyncGenerator<MessageSummary> {
+    do {
+      const page = await this.listMessagesPage({ ...options, after });
+      yield* page.messages;
+      after = page.next ?? undefined;
+    } while (after);
+  }
+
+  /**
+   * Stops a message that has not started sending. Each recipient of a multi-recipient send has its own id.
+   * Throws OutboxApiError with code `not_cancellable` once it is sending or finished. Safe to retry.
+   */
+  cancelMessage(id: string, { signal }: RequestOptions = {}): Promise<CancelResult> {
+    if (!UUID.test(id)) throw new OutboxError('A message UUID is required');
+    return this.#request<CancelResult>('POST', `/v1/messages/${id}/cancel`, { retryable: true, signal });
+  }
+
+  /** The newest suppressed addresses. Suppression calls need a full-access API key. */
+  async listSuppressions(options: ListSuppressionsOptions = {}): Promise<Suppression[]> {
+    return (await this.listSuppressionsPage(options)).suppressions;
+  }
+
+  /** One page, newest first. Pass `next` back as `after` until it is null. */
+  listSuppressionsPage({ limit, after, signal }: ListSuppressionsOptions = {}): Promise<SuppressionPage> {
+    return this.#request<SuppressionPage>('GET', '/v1/suppressions' + query({ limit, after }), { retryable: true, signal });
+  }
+
+  /** Every suppressed address, newest first, fetched a page at a time. */
+  async *iterateSuppressions({ after, ...options }: ListSuppressionsOptions = {}): AsyncGenerator<Suppression> {
+    do {
+      const page = await this.listSuppressionsPage({ ...options, after });
+      yield* page.suppressions;
+      after = page.next ?? undefined;
+    } while (after);
+  }
+
+  /** Stops all mail to an address. Adding one that is already suppressed succeeds and keeps its reason. */
+  addSuppression(email: string, { signal }: RequestOptions = {}): Promise<{ email: string }> {
+    checkEmail(email);
+    return this.#request<{ email: string }>('POST', '/v1/suppressions', { body: { email }, retryable: true, signal });
+  }
+
+  /**
+   * Removes a `manual` suppression. Bounces, complaints and unsubscribes can't be removed (code `conflict`);
+   * an address that isn't suppressed gives `not_found`. Not retried automatically, since a retry after a
+   * lost response would report `not_found` for an address that was removed.
+   */
+  removeSuppression(email: string, { signal }: RequestOptions = {}): Promise<{ removed: string }> {
+    checkEmail(email);
+    return this.#request<{ removed: string }>('DELETE', '/v1/suppressions/' + encodeURIComponent(email), { retryable: false, signal });
   }
 
   async #request<T>(method: string, path: string, { body, idempotencyKey, retryable, signal }: { body?: unknown; idempotencyKey?: string; retryable: boolean; signal?: AbortSignal }): Promise<T> {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+Requires the matching API release for paging, `cancelMessage` and suppression paging.
+
+**Breaking (types only; runtime behaviour is unchanged):**
+- `Message` is now a union. Content is either `subject` plus `html` and/or `text`, or `template` (with optional `data`). Messages with no content, a subject without a body, or a template mixed with `subject`/`html`/`text` no longer compile; the API rejected the first two and silently ignored the inline content in the third.
+- `BatchMessage` is a type alias instead of an interface, so `interface X extends Message` no longer works; use `type X = Message & { … }`.
+
+**Added:**
+- Message paging: `listMessagesPage()` returns `{ messages, next }`, `iterateMessages()` walks every page, and all three list methods accept `to` (recipient contains) and `after`.
+- `cancelMessage(id)` stops a queued message. Throws `not_cancellable` once sending has started; repeat calls succeed, so it is retried like other safe requests.
+- Suppressions: `listSuppressions()`, `listSuppressionsPage()`, `iterateSuppressions()`, `addSuppression(email)` and `removeSuppression(email)` (manual suppressions only; not retried automatically). Need a full-access key.
+- `ErrorCode` includes `not_cancellable`.
+
 ## 0.3.1
 
 - A 2xx response with an empty or non-JSON body is retried with the same idempotency key instead of failing straight away; if it persists, `OutboxApiError` has code `invalid_response`.

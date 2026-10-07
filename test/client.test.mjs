@@ -160,6 +160,47 @@ test('Retry-After is honoured as seconds or an HTTP date and exposed on the erro
   assert.ok(Date.now() - started < 1_000, 'a past date retries immediately');
 });
 
+test('iterateMessages follows next until the last page', async () => {
+  const urls = [];
+  const pages = { '': { messages: [{ id: 'm1' }, { id: 'm2' }], next: 'c1' }, c1: { messages: [{ id: 'm3' }], next: null } };
+  const mail = client(async (u) => { urls.push(u); return json(pages[new URL(u).searchParams.get('after') ?? '']); });
+  const ids = [];
+  for await (const m of mail.iterateMessages({ status: 'sent', to: 'ada', limit: 2 })) ids.push(m.id);
+  assert.deepEqual(ids, ['m1', 'm2', 'm3']);
+  assert.deepEqual(urls, ['https://mail.example.com/v1/messages?status=sent&to=ada&limit=2', 'https://mail.example.com/v1/messages?status=sent&to=ada&limit=2&after=c1']);
+  assert.deepEqual(await mail.listMessagesPage({ after: 'c1' }), pages.c1);
+});
+
+test('cancelMessage posts to the message and is retried safely', async () => {
+  const calls = [];
+  const mail = client(async (u, init) => { calls.push([init.method, u]); return calls.length === 1 ? json({ error: 'down' }, 503, { 'retry-after': '0' }) : json({ id: ID, status: 'cancelled' }); });
+  assert.deepEqual(await mail.cancelMessage(ID), { id: ID, status: 'cancelled' });
+  assert.deepEqual(calls, [['POST', `https://mail.example.com/v1/messages/${ID}/cancel`], ['POST', `https://mail.example.com/v1/messages/${ID}/cancel`]]);
+  assert.throws(() => mail.cancelMessage('../suppressions'), /UUID/);
+
+  const late = client(async () => json({ error: 'this message is already sent', code: 'not_cancellable' }, 409));
+  await assert.rejects(late.cancelMessage(ID), (e) => e instanceof OutboxApiError && e.code === 'not_cancellable' && e.status === 409);
+});
+
+test('suppressions: page, add, and remove without retrying', async () => {
+  const calls = [];
+  const mail = client(async (u, init) => {
+    calls.push([init.method, u, init.body]);
+    if (init.method === 'GET') return json(new URL(u).searchParams.get('after') ? { suppressions: [{ email: 'b@x.com', reason: 'bounce' }], next: null } : { suppressions: [{ email: 'a@x.com', reason: 'manual' }], next: 'c1' });
+    if (init.method === 'POST') return json({ email: 'a@x.com' }, 201);
+    return json({ error: 'busy' }, 503, { 'retry-after': '0' });
+  });
+  const emails = [];
+  for await (const s of mail.iterateSuppressions({ limit: 1 })) emails.push(s.email);
+  assert.deepEqual(emails, ['a@x.com', 'b@x.com']);
+  assert.deepEqual((await mail.listSuppressions()).map((s) => s.reason), ['manual']);
+  assert.deepEqual(await mail.addSuppression('a@x.com'), { email: 'a@x.com' });
+  assert.deepEqual(JSON.parse(calls.find((c) => c[0] === 'POST')[2]), { email: 'a@x.com' });
+  await assert.rejects(mail.removeSuppression('a+b@x.com'), { status: 503 });
+  assert.deepEqual(calls.filter((c) => c[0] === 'DELETE').map((c) => c[1]), ['https://mail.example.com/v1/suppressions/a%2Bb%40x.com']);
+  assert.throws(() => mail.addSuppression('nope'), /valid email/);
+});
+
 test('the published types compile for CommonJS and ESM consumers', () => {
   const tsc = fileURLToPath(new URL('../node_modules/typescript/bin/tsc', import.meta.url));
   execFileSync(process.execPath, [tsc, '-p', fileURLToPath(new URL('types/tsconfig.json', import.meta.url))], { stdio: 'pipe' });

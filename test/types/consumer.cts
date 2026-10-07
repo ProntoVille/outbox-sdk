@@ -2,7 +2,7 @@
 import sdk = require('@getoutbox/sdk');
 
 const outbox = new sdk.Outbox({ apiKey: 'key' });
-export const sent: Promise<sdk.SendResult> = outbox.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }, { idempotencyKey: 'k' });
+export const sent: Promise<sdk.SendResult> = outbox.send({ from: 'a@x.com', to: 'b@x.com', subject: 's', text: 't' }, { idempotencyKey: 'k' });
 
 export function describe(e: unknown): string | null {
   if (e instanceof sdk.OutboxConnectionError) return e.code;

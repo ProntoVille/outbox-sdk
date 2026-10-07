@@ -36,6 +36,8 @@ CommonJS: `const { Outbox } = require('@getoutbox/sdk');`
 | `replyTo` | Where replies go, e.g. a support inbox. |
 | `subject` + `html` and/or `text` | Message content. A text part is generated from `html` when omitted. |
 | `template` + `data` | Template id or slug, in place of subject and body. Missing variables return 422. |
+
+Content is either `subject` with `html` and/or `text`, or a `template`. The types reject anything else at compile time: no content, a subject without a body, or `template` together with `subject`, `html` or `text` (the template would silently replace them).
 | `attachments` | Up to 10 files, 10 MB in total. `content` is a base64 string or bytes. Set `contentId` to embed an image as `cid:…`. |
 | `headers` | Up to 20 custom headers, e.g. `X-Entity-Ref`. |
 | `metadata` | Up to 10 strings of your own (order id, user id), returned by `getMessage()` and in webhooks. |
@@ -69,10 +71,41 @@ const batch = await outbox.sendBatch(users.map((u) => ({
 for (const r of batch.results) if ('error' in r) console.warn(r.index, r.error);
 
 const message = await outbox.getMessage(id);            // status, attempts, last_error, …
-const bounced = await outbox.listMessages({ status: 'bounced', limit: 100 });
+const recent = await outbox.listMessages({ status: 'bounced', limit: 100 }); // newest 100
+
+for await (const m of outbox.iterateMessages({ status: 'bounced', to: '@example.com' })) {
+  console.log(m.id, m.to_email, m.created_at);           // every match, a page at a time
+}
 ```
 
 `sendBatch` takes 1–100 messages. Items succeed or fail independently, so the call resolves even when some items fail.
+
+`listMessages` returns one page (up to 200). `iterateMessages` follows the cursor for you; to page by hand, call `listMessagesPage()` and pass its `next` back as `after` until it is `null`.
+
+## Cancel a message
+
+```ts
+try {
+  await outbox.cancelMessage(id);
+} catch (e) {
+  if (e instanceof OutboxApiError && e.code === 'not_cancellable') { /* already sending or finished */ }
+  else throw e;
+}
+```
+
+Only a **queued** message can be cancelled; once a worker has started sending it, the API returns `not_cancellable` (409). Each recipient of a multi-recipient send has its own id. Cancelling twice succeeds, so retries are safe. Managed-sending usage for a cancelled message is refunded.
+
+## Suppressions
+
+Suppressed addresses are never sent to. Bounces, complaints and unsubscribes are added automatically; you can add your own.
+
+```ts
+await outbox.addSuppression('ada@example.com');        // reason 'manual'
+for await (const s of outbox.iterateSuppressions()) console.log(s.email, s.reason);
+await outbox.removeSuppression('ada@example.com');     // manual suppressions only
+```
+
+Suppression calls need a **full-access** API key; sending keys get `forbidden`. Removing a bounce, complaint or unsubscribe returns `conflict`, because those protect your sender reputation and the recipient's choice. `removeSuppression` is not retried automatically: a retry after a lost response would report `not_found` for an address that was removed.
 
 ## Retries and idempotency
 
@@ -105,7 +138,8 @@ try {
 | `invalid_request`, `invalid_address`, `invalid_attachment`, `invalid_header`, `too_many_recipients` | 400 | Fix the request. |
 | `unauthorized` / `forbidden`, `sender_domain_not_allowed` | 401 / 403 | Bad key, or a sending key used outside its scope or domain. |
 | `quota_exceeded` | 402 | Monthly allowance and credits used up. |
-| `template_not_found` | 404 | No template with that id or slug. |
+| `template_not_found`, `not_found` | 404 | No template, message or suppression with that id. |
+| `not_cancellable`, `conflict` | 409 | The message is already sending or finished; the suppression can't be removed. |
 | `domain_not_verified`, `sending_not_configured`, `missing_template_data`, `unsupported_by_provider` | 422 | Fix your setup or data. |
 | `rate_limited`, `sandbox_limit_reached` | 429 | Retried automatically. |
 | `invalid_response` | 2xx | The API answered but the body could not be read, even after retries. A send was probably accepted; retry with `e.idempotencyKey` to confirm. |
