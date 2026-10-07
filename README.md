@@ -30,13 +30,33 @@ CommonJS: `const { Outbox } = require('@getoutbox/sdk');`
 
 | Field | |
 |---|---|
-| `to`, `from` | Required. `from` must be on a verified domain. |
-| `toName`, `fromName` | Display names. |
+| `to`, `from` | Required. `from` must be on a verified domain. `to` may be a list. |
+| `cc`, `bcc` | One address or a list. Bcc addresses never appear in headers. |
+| `toName`, `fromName` | Display names. Or write addresses as `Ada Obi <ada@example.com>`. |
 | `replyTo` | Where replies go, e.g. a support inbox. |
 | `subject` + `html` and/or `text` | Message content. A text part is generated from `html` when omitted. |
 | `template` + `data` | Template id or slug, in place of subject and body. Missing variables return 422. |
+| `attachments` | Up to 10 files, 10 MB in total. `content` is a base64 string or bytes. Set `contentId` to embed an image as `cid:…`. |
+| `headers` | Up to 20 custom headers, e.g. `X-Entity-Ref`. |
+| `metadata` | Up to 10 strings of your own (order id, user id), returned by `getMessage()` and in webhooks. |
 
 `send()` resolves when the message is **queued**, not delivered. Track it with `getMessage()` or signed webhooks.
+
+Every address in `to`, `cc` and `bcc` (at most 50) becomes its own message with its own id, status and bounce tracking, and counts as one email for billing. `result.id` is the first recipient's; `result.recipients` lists them all. Each copy shows the full To and Cc lines. Multiple recipients need managed sending, SES or SMTP; a Cloudflare or ZeptoMail route returns `unsupported_by_provider`.
+
+```ts
+import { readFile } from 'node:fs/promises';
+
+await outbox.send({
+  from: 'billing@your-verified-domain.com',
+  to: 'Ada Obi <ada@example.com>',
+  bcc: 'archive@your-verified-domain.com',
+  subject: 'Your invoice',
+  html: '<p>Invoice attached.</p>',
+  attachments: [{ filename: 'invoice.pdf', content: await readFile('invoice.pdf') }],
+  metadata: { invoice_id: 'inv_123' },
+});
+```
 
 ## Batch, status and history
 
@@ -66,18 +86,45 @@ A retry never sends twice. `send()` always carries an idempotency key and genera
 try {
   await outbox.send(message);
 } catch (e) {
-  if (e instanceof OutboxApiError) console.error(e.status, e.message, e.body);
-  else throw e; // network error or timeout after retries, or AbortError
+  if (!(e instanceof OutboxApiError)) throw e; // network error or timeout after retries, or AbortError
+  if (e.code === 'domain_not_verified') { /* prompt to finish DNS setup */ }
+  console.error(e.status, e.code, e.message, e.requestId); // quote requestId to support
 }
 ```
 
-| Status | Meaning |
-|---|---|
-| 400 | Invalid message. |
-| 401 / 403 | Bad key or no access. |
-| 402 | Account limit or credits exhausted. |
-| 404 | Template not found. |
-| 422 | Unverified sender domain, no transactional route, or missing template data. |
+Branch on `e.code`; the message text may change. Common codes:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_request`, `invalid_address`, `invalid_attachment`, `invalid_header`, `too_many_recipients` | 400 | Fix the request. |
+| `unauthorized` / `forbidden`, `sender_domain_not_allowed` | 401 / 403 | Bad key, or a sending key used outside its scope or domain. |
+| `quota_exceeded` | 402 | Monthly allowance and credits used up. |
+| `template_not_found` | 404 | No template with that id or slug. |
+| `domain_not_verified`, `sending_not_configured`, `missing_template_data`, `unsupported_by_provider` | 422 | Fix your setup or data. |
+| `rate_limited`, `sandbox_limit_reached` | 429 | Retried automatically. |
+
+The full list is in the [OpenAPI spec](https://outboxstack.app/openapi.json).
+
+## Webhooks
+
+Verify every webhook before trusting it. Pass the **raw** request body, not re-serialised JSON:
+
+```ts
+import { verifyWebhook, WebhookVerificationError } from '@getoutbox/sdk';
+
+app.post('/hooks/outbox', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const event = await verifyWebhook(req.body, req.headers, process.env.OUTBOX_WEBHOOK_SECRET!);
+    if (event.type === 'message.bounced') await markUndeliverable(event.data.to, event.data.metadata);
+    res.sendStatus(200);
+  } catch (e) {
+    if (e instanceof WebhookVerificationError) return res.sendStatus(400);
+    throw e;
+  }
+});
+```
+
+Signatures follow Standard Webhooks; timestamps older than 5 minutes are rejected.
 
 ## Options
 
@@ -93,7 +140,7 @@ new Outbox({
 
 Every method also accepts `{ signal }` (an `AbortSignal`) to cancel the request and any pending retries.
 
-Keep API keys on the server. Never ship them in browser or mobile bundles. Escape untrusted values before putting them in `html`.
+Use a **sending** API key (the dashboard default) in apps that only send: it can't change your workspace, and can be locked to one sender domain. Keep API keys on the server. Never ship them in browser or mobile bundles. Escape untrusted values before putting them in `html`.
 
 ## Development and releases
 

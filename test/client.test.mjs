@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { Outbox, OutboxApiError, MailClient, VERSION } from '../dist/index.js';
+import { Outbox, OutboxApiError, MailClient, VERSION, verifyWebhook, WebhookVerificationError } from '../dist/index.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
@@ -98,4 +98,49 @@ test('configuration is validated before any secret is sent', () => {
   assert.doesNotThrow(() => new Outbox());
   if (saved === undefined) delete process.env.OUTBOX_API_KEY; else process.env.OUTBOX_API_KEY = saved;
   assert.throws(() => client(async () => {}).getMessage('../api-keys'), /UUID/);
+});
+
+test('multi-recipient sends pass through and attachments bytes are base64-encoded', async () => {
+  let sent;
+  const mail = client(async (_u, init) => { sent = JSON.parse(init.body); return json({ id: ID, status: 'queued', recipients: [{ email: 'a@x.com', id: ID, status: 'queued', duplicate: false }, { email: 'b@x.com', id: ID, status: 'queued', duplicate: false }] }, 202); });
+  const result = await mail.send({
+    from: 'app@x.com', to: ['Ada <a@x.com>'], cc: 'b@x.com', bcc: ['c@x.com'], subject: 's', text: 't',
+    headers: { 'X-Entity-Ref': 'inv-1' }, metadata: { order_id: '42' },
+    attachments: [{ filename: 'a.txt', content: new TextEncoder().encode('hi') }, { filename: 'b.txt', content: 'aGk=' }],
+  });
+  assert.equal(result.recipients.length, 2);
+  assert.deepEqual(sent.attachments.map((a) => a.content), ['aGk=', 'aGk=']);
+  assert.deepEqual(sent.cc, 'b@x.com');
+  assert.deepEqual(sent.metadata, { order_id: '42' });
+});
+
+test('API errors expose code and request id', async () => {
+  const mail = client(async () => json({ error: 'verify example.com', code: 'domain_not_verified', request_id: 'req_abc' }, 422));
+  await assert.rejects(mail.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }), (e) => e.code === 'domain_not_verified' && e.requestId === 'req_abc' && e.status === 422);
+  const bare = client(async () => new Response('oops', { status: 400, headers: { 'x-request-id': 'req_hdr' } }));
+  await assert.rejects(bare.send({ from: 'a@x.com', to: 'b@x.com', text: 't' }), (e) => e.code === 'error' && e.requestId === 'req_hdr');
+});
+
+// Shared vector: the Go signer and PHP verifier are tested against the same values.
+const VECTOR = {
+  secret: 'whsec_b3V0Ym94LXNoYXJlZC10ZXN0LXZlY3Rvci1rZXktMzI=',
+  body: '{"type":"message.delivered","created_at":"2026-10-06T16:00:00Z","data":{"message_id":"11111111-1111-4111-8111-111111111111","to":"ada@example.com","metadata":{"order_id":"42"}}}',
+  headers: { 'Webhook-Id': 'msg_2Lrf8Kq', 'webhook-timestamp': '1791300000', 'webhook-signature': 'v0,bogus v1,MCdWC/xo85YYQTUvU1t7W9dodNDOfd581ZfFQByu58U=' },
+  now: 1791300000 * 1000 + 60_000,
+};
+
+test('verifyWebhook accepts the shared vector and returns the event', async () => {
+  const event = await verifyWebhook(VECTOR.body, VECTOR.headers, VECTOR.secret, { now: VECTOR.now });
+  assert.equal(event.type, 'message.delivered');
+  assert.equal(event.data.metadata.order_id, '42');
+  const viaHeaders = await verifyWebhook(new TextEncoder().encode(VECTOR.body), new Headers(VECTOR.headers), VECTOR.secret, { now: VECTOR.now });
+  assert.equal(viaHeaders.data.to, 'ada@example.com');
+});
+
+test('verifyWebhook rejects tampering, stale timestamps, wrong secrets and missing headers', async () => {
+  const reject = (p) => assert.rejects(p, WebhookVerificationError);
+  await reject(verifyWebhook(VECTOR.body.replace('42', '43'), VECTOR.headers, VECTOR.secret, { now: VECTOR.now }));
+  await reject(verifyWebhook(VECTOR.body, VECTOR.headers, VECTOR.secret, { now: VECTOR.now + 10 * 60_000 }));
+  await reject(verifyWebhook(VECTOR.body, VECTOR.headers, 'whsec_' + btoa('another-secret-another-secret!!'), { now: VECTOR.now }));
+  await reject(verifyWebhook(VECTOR.body, { 'webhook-id': 'x' }, VECTOR.secret, { now: VECTOR.now }));
 });

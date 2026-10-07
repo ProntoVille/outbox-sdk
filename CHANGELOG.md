@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- `to` accepts a list; new `cc` and `bcc`. Each recipient gets its own message id, returned in `result.recipients`. Requires the matching API release.
+- `attachments` (base64 string or raw bytes, up to 10 files / 10 MB, inline images via `contentId`), custom `headers`, and `metadata` returned by `getMessage()` and in webhooks.
+- `OutboxApiError.code` (stable, typed `ErrorCode`) and `OutboxApiError.requestId`. Batch item errors include `code`.
+- `verifyWebhook(rawBody, headers, secret)` checks Standard Webhooks signatures (constant-time, 5-minute tolerance) and returns a typed event. Throws `WebhookVerificationError`.
+
 ## 0.2.0
 
 - `replyTo` and `toName` message fields (requires the matching API release).

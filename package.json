@@ -1,6 +1,6 @@
 {
   "name": "@getoutbox/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Outbox transactional email SDK for Node.js and TypeScript",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -44,6 +44,6 @@
   },
   "devDependencies": {
     "esbuild": "^0.25.0",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }
